@@ -1,0 +1,39 @@
+{
+  "serial_port": "/dev/serial0",
+  "baudrate": 115200,
+
+  "database": "cars.db",
+
+  "mqtt": {
+    "broker": "example.broker.fqdn",
+    "port": 1883,
+    "topic": "carcount/car_detect",
+    "username": "",
+    "password": ""
+  },
+
+  "http": {
+    "host": "0.0.0.0",
+    "port": 80
+  },
+
+  "detection": {
+    "min_mm": 300,
+    "max_mm": 3000,
+    "debounce_ms": 200,
+    "ignore_zero_distance": true,
+    "min_strength": 0,
+    "test_mode": false
+  },
+
+  "schedule": {
+    "url": "https://raw.githubusercontent.com/Username/Project/blob/main/Schedule.json",
+    "check_interval_sec": 1200,
+    "github_token": "INSERT_TOKEN_HERE"
+  },
+  "azure": {
+    "account_name": "carcounterdb",
+    "container_name": "lidarbackup",
+    "sas_token": "INSERT_SAS_TOKEN_HERE"
+  }
+}

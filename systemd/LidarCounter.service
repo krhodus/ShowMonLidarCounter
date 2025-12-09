@@ -1,0 +1,13 @@
+[Unit]
+Description=TFmini Car Counter
+After=network.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/tfmini-car-counter
+ExecStart=/home/pi/tfmini-venv/bin/python3 app.py
+Restart=always
+SupplementaryGroups=dialout
+
+[Install]
+WantedBy=multi-user.target
