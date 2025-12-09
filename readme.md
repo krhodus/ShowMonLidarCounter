@@ -1,4 +1,4 @@
-# TFmini Car Counter
+# ShowMon Lidar Car Counter
 
 Tracks cars with a TFmini-Plus LiDAR on a Raspberry Pi. Features:
 
@@ -7,14 +7,16 @@ Tracks cars with a TFmini-Plus LiDAR on a Raspberry Pi. Features:
 - MQTT publishing
 - Flask web UI
 - Configurable detection window
-- Reset counter
+- Follows schedule published on private GitHub repo
+- Automatic backup to Azure blob
+
 
 ## Install
 
 Clone repo and run:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/tfmini-car-counter.git
-cd tfmini-car-counter
+git clone https://github.com/krhodus/ShowMon-CarCounter.git
+cd ShowMon-CarCounter
 chmod +x install.sh
 ./install.sh
