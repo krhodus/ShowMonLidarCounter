@@ -1,34 +1,5 @@
 #!/usr/bin/env python3
 """                                                                                                   
-                                                  ++                                                
-                                                 ++++                                               
-                                         ++      ++++     +                                         
-                                         ++++ ++++  ++++++++                                        
-                                          +++++        ++++                                         
-                                  +++   ++++              ++++ ++++                                 
-                                  ++++++                     +++++                                  
-                           ++    ++++                           ++++   +++                          
-                          ++++++++             +++++++             +++++++                          
-                           ++++                +++++++                +++                           
-                    ++  ++++                   +++++++                  ++++    +                   
-                    +++++                      +++++++                     +++++++                  
-                     +++                       +++++++                       +++                    
-                     ++                        +++++++                        ++                    
-                    ++                                                         ++                   
-               ++  ++                                                           ++                  
-               +++++                                                            ++++++              
-                 ++                                                              ++++               
-                ++                                                                ++                
-               ++   +++    +++++++  +++++  ++    ++   ++++++  ++   ++ +++++++ ++++  ++               
-           ++ ++    ++     ++   ++  ++ +++ ++    ++  ++       ++   ++    ++   ++      ++              
-           ++++     ++     ++   +++ +++++  ++.   ++  ++   +++ +++++++    ++    +++   +++++           
-            ++      +++++  ++  +++  ++     ++++  ++  ++++++++ ++   ++    ++  +++++    +++           
-           +++                                                                        ++            
-     +++  ++                                                                           ++    +      
-     ++++++                                                                             +++++++     
-      +++                                                                                 ++++      
-                                                                                            ++  
-
           ░██████   ░██     ░██   ░██████   ░██       ░██ ░███     ░███   ░██████   ░███    ░██ 
          ░██   ░██  ░██     ░██  ░██   ░██  ░██       ░██ ░████   ░████  ░██   ░██  ░████   ░██ 
         ░██         ░██     ░██ ░██     ░██ ░██  ░██  ░██ ░██░██ ░██░██ ░██     ░██ ░██░██  ░██ 
@@ -38,7 +9,9 @@
           ░██████   ░██     ░██   ░██████   ░███     ░███ ░██       ░██   ░██████   ░██    ░███ 
 
 
-LDPLights Lidar Car Counter
+Light Show Network ShowMon Lidar Car Counter
+v1.0
+
 """
 
 import json
@@ -47,52 +20,52 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
+import subprocess
 
 import requests
 import paho.mqtt.client as mqtt
 import serial
 from flask import Flask, jsonify, request, render_template
 
-
 DEBUG_SENSOR = True
 
-# ----------------- CONFIG -----------------
+# ----------------- PATHS & CONFIG -----------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(BASE_DIR, "config.json")
+SCHED_LOCAL_PATH = os.path.join(BASE_DIR, "schedule.json")
+
 if not os.path.exists(CFG_PATH):
     raise SystemExit("Missing config.json")
 
 with open(CFG_PATH, "r") as f:
     cfg = json.load(f)
 
+# --- Top-level config ---
 SERIAL_PORT = cfg.get("serial_port", "/dev/serial0")
 BAUD = cfg.get("baudrate", 115200)
+DB_PATH = os.path.join(BASE_DIR, cfg.get("database", "cars.db"))
 
 MQTT_CFG = cfg.get("mqtt", {})
 MQTT_BROKER = MQTT_CFG.get("broker", "localhost")
 MQTT_PORT = MQTT_CFG.get("port", 1883)
-MQTT_TOPIC = MQTT_CFG.get("topic", "tfmini/car_detect")
-MQTT_USER = MQTT_CFG.get("username")
-MQTT_PASS = MQTT_CFG.get("password")
-
-DB_PATH = os.path.join(BASE_DIR, cfg.get("database", "cars.db"))
-
-DETECTION_CFG = cfg.get("detection", {})
-MIN_MM = float(DETECTION_CFG.get("min_mm", 300))
-MAX_MM = float(DETECTION_CFG.get("max_mm", 3000))
-DEBOUNCE_MS = int(DETECTION_CFG.get("debounce_ms", 200))
-IGNORE_ZERO_DISTANCE = bool(DETECTION_CFG.get("ignore_zero_distance", True))
-MIN_STRENGTH = int(DETECTION_CFG.get("min_strength", 0))
+MQTT_TOPIC = MQTT_CFG.get("topic", "carcount/car_detect")
+MQTT_USER = MQTT_CFG.get("username") or None
+MQTT_PASS = MQTT_CFG.get("password") or None
 
 HTTP_CFG = cfg.get("http", {})
 HTTP_HOST = HTTP_CFG.get("host", "0.0.0.0")
 HTTP_PORT = int(HTTP_CFG.get("port", 80))
 
+DETECTION_CFG = cfg.get("detection", {})
+DEBOUNCE_MS = int(DETECTION_CFG.get("debounce_ms", 200))
+IGNORE_ZERO_DISTANCE = bool(DETECTION_CFG.get("ignore_zero_distance", True))
+MIN_STRENGTH = int(DETECTION_CFG.get("min_strength", 0))
+TEST_MODE_DEFAULT = bool(DETECTION_CFG.get("test_mode", False))
+
 SCHEDULE_CFG = cfg.get("schedule", {})
 SCHEDULE_URL = SCHEDULE_CFG.get("url", "")
 GITHUB_TOKEN = SCHEDULE_CFG.get("github_token", "")
-
-SCHEDULE_REFRESH_SECONDS = 20 * 60  # 20 minutes
+SCHEDULE_REFRESH_SECONDS = int(SCHEDULE_CFG.get("check_interval_sec", 1200))
 
 # ----------------- DB -----------------
 def init_db():
@@ -122,8 +95,10 @@ def init_db():
     conn.commit()
     return conn
 
+
 db_conn = init_db()
 db_lock = threading.Lock()
+
 
 def increment_count_and_save(distance_mm: int):
     ts = datetime.now(timezone.utc).isoformat()
@@ -171,25 +146,25 @@ try:
 except Exception as e:
     print("Warning: could not connect to MQTT broker:", e)
 
+
 def publish_detection(distance_mm: int):
     now_utc = datetime.now(timezone.utc).isoformat()
 
-    # --- Query DB counts ---
     with db_lock:
         cur = db_conn.cursor()
-
-        # Today
+        # Today (local)
         cur.execute(
-            "SELECT COUNT(*) FROM detections WHERE date(ts_utc, 'localtime') = date('now', 'localtime');"
+            "SELECT COUNT(*) FROM detections "
+            "WHERE date(ts_utc, 'localtime') = date('now', 'localtime');"
         )
         count_today = cur.fetchone()[0]
 
-        # Week
+        # Last 7 days
         cur.execute(
-            "SELECT COUNT(*) FROM detections WHERE ts_utc >= datetime('now','localtime','-7 days');"
+            "SELECT COUNT(*) FROM detections "
+            "WHERE ts_utc >= datetime('now','localtime','-7 days');"
         )
         count_week = cur.fetchone()[0]
-
 
         # All time
         cur.execute("SELECT value FROM metadata WHERE key='total_count';")
@@ -200,7 +175,8 @@ def publish_detection(distance_mm: int):
         "ts_utc": now_utc,
         "count_today": count_today,
         "count_week": count_week,
-        "total_all_time": total_all_time
+        "total_all_time": total_all_time,
+        "last_distance_mm": int(distance_mm),
     }
 
     try:
@@ -235,7 +211,6 @@ def parse_tfmini_frame(buf: bytes):
         return None
     return {"distance_mm": distance, "strength": strength}
 
-
 # ----------------- Global state -----------------
 state_lock = threading.Lock()
 
@@ -248,7 +223,7 @@ state = {
 }
 
 # test mode and manual override
-test_mode = False
+test_mode = TEST_MODE_DEFAULT
 test_count_today = 0
 manual_override = False
 
@@ -262,14 +237,16 @@ schedule_active = False
 # ----------------- Schedule helpers -----------------
 def compute_schedule_flags(now_local: datetime):
     """
-    Returns (valid, active, enable) for the current local time.
+    Returns (valid, active, enable) for the given local time.
     - valid: schedule entry is present and times parse
     - active: now between StartShow and ShowStop (including overnight wrap)
     - enable: entry.Enable is True
     """
     global schedule_data
 
-    data = schedule_data
+    with state_lock:
+        data = schedule_data
+
     if not data:
         return False, False, False
 
@@ -305,16 +282,16 @@ def compute_schedule_flags(now_local: datetime):
 
 def refresh_schedule():
     """
-    Fetch schedule JSON from GitHub (or other URL).
-    Schedule URL and GitHub token come from config.json.
+    Fetch schedule JSON from GitHub (or other URL) and update schedule_data.
+    Also writes to local schedule.json if successful.
     """
     global schedule_data, schedule_last_fetch_utc, schedule_last_status
 
     url = SCHEDULE_URL
     if not url:
         with state_lock:
-            schedule_last_status = "No schedule URL configured"
             schedule_last_fetch_utc = datetime.now(timezone.utc).isoformat()
+            schedule_last_status = "No schedule URL configured"
         return False
 
     headers = {}
@@ -327,18 +304,71 @@ def refresh_schedule():
         data = resp.json()
         if not isinstance(data, list) or len(data) != 7:
             raise ValueError("Schedule JSON must be a list of 7 entries")
+
+        # Store schedule
         with state_lock:
-            # store full schedule
             globals()["schedule_data"] = data
             globals()["schedule_last_fetch_utc"] = datetime.now(
                 timezone.utc
             ).isoformat()
             globals()["schedule_last_status"] = "OK"
+
+        # Write local copy
+        try:
+            with open(SCHED_LOCAL_PATH, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print("Warning: could not write local schedule.json:", e)
+            
+        # schedule evaluation
+        try:
+            now_local = datetime.now()
+            valid, active, enabled = compute_schedule_flags(now_local)
+            with state_lock:
+                globals()["schedule_valid"] = valid
+                globals()["schedule_active"] = (
+                    True if manual_override else (valid and enabled and active)
+                )
+        except Exception as e:
+            print("Immediate schedule eval failed:", e)
+
         return True
+
     except Exception as e:
         with state_lock:
-            schedule_last_fetch_utc = datetime.now(timezone.utc).isoformat()
-            schedule_last_status = f"Error: {e}"
+            globals()["schedule_last_fetch_utc"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            globals()["schedule_last_status"] = f"Error: {e}"
+        return False
+    
+
+def load_local_schedule():
+    """
+    Load schedule from local schedule.json and update schedule_data.
+    Used by /api/schedule/local.
+    """
+    global schedule_data, schedule_last_fetch_utc, schedule_last_status
+
+    if not os.path.exists(SCHED_LOCAL_PATH):
+        return False
+
+    try:
+        with open(SCHED_LOCAL_PATH, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, list) or len(data) != 7:
+            raise ValueError("schedule.json must be a list of 7 entries")
+
+        with state_lock:
+            globals()["schedule_data"] = data
+            globals()["schedule_last_fetch_utc"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            globals()["schedule_last_status"] = "Loaded from local schedule.json"
+
+        return True
+    except Exception as e:
+        print("Error loading local schedule:", e)
         return False
 
 
@@ -350,14 +380,13 @@ def schedule_loop():
         refresh_schedule()
 
 # ----------------- Sensor loop -----------------
-
 def dlog(msg):
     if DEBUG_SENSOR:
         print("DEBUG:", msg)
 
 
 def sensor_loop():
-    global MIN_MM, MAX_MM, IGNORE_ZERO_DISTANCE, MIN_STRENGTH, DEBOUNCE_MS, DEBUG_SENSOR
+    global IGNORE_ZERO_DISTANCE, MIN_STRENGTH, DEBOUNCE_MS, DEBUG_SENSOR
 
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD, timeout=1)
@@ -413,6 +442,7 @@ def sensor_loop():
                 if MIN_STRENGTH and strength < MIN_STRENGTH:
                     valid_reading = False
 
+                # "Car sample" = any valid sample with non-zero distance
                 is_car_sample = valid_reading and distance_mm > 0
 
                 # ---- Update state for API ----
@@ -421,7 +451,6 @@ def sensor_loop():
                     state["last_strength"] = strength
                     state["last_valid_reading"] = valid_reading
 
-                    ### FIXED HERE — get up-to-date schedule state safely
                     sched_ok = schedule_active or manual_override
                     tm = test_mode
 
@@ -434,10 +463,12 @@ def sensor_loop():
                     if not car_active and car_since_ms is not None:
                         if now_ms - car_since_ms >= DEBOUNCE_MS:
 
-                            ### FIXED — enforce schedule BEFORE counting
+                            # Enforce schedule BEFORE counting
                             if not sched_ok:
-                                dlog("*** CAR DETECTED but schedule inactive — IGNORING ***")
-                                car_active = True    # latch but do NOT count
+                                dlog(
+                                    "*** CAR DETECTED but schedule inactive — IGNORING ***"
+                                )
+                                car_active = True  # latch but do NOT count
                                 with state_lock:
                                     state["car_present"] = True
                                 continue
@@ -468,6 +499,7 @@ def sensor_loop():
             print("Serial read error:", e)
             time.sleep(0.5)
 
+
 def handle_detection(distance_mm: int, log_to_db: bool):
     global test_count_today
 
@@ -490,6 +522,26 @@ def handle_detection(distance_mm: int, log_to_db: bool):
     except Exception as e:
         print("MQTT publish error:", e)
 
+# ----------------- SCHEDULE EVAL LOOP -----------------
+def schedule_eval_loop():
+    """Recompute schedule_active & schedule_valid once per minute."""
+    global schedule_valid, schedule_active
+
+    while True:
+        try:
+            now_local = datetime.now()  # Pi is assumed to keep local timezone
+            valid, active, enabled = compute_schedule_flags(now_local)
+
+            with state_lock:
+                schedule_valid = valid
+                if manual_override:
+                    schedule_active = True
+                else:
+                    schedule_active = valid and enabled and active
+        except Exception as e:
+            print("Schedule eval error:", e)
+
+        time.sleep(60)  # recompute every minute
 
 # ----------------- Flask app -----------------
 app = Flask(__name__, template_folder="templates")
@@ -498,6 +550,16 @@ app = Flask(__name__, template_folder="templates")
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/config")
+def config_page():
+    return render_template("config.html")
+
+
+@app.route("/schedule")
+def schedule_page():
+    return render_template("schedule.html")
 
 
 @app.route("/api/status", methods=["GET"])
@@ -528,70 +590,68 @@ def api_status():
         }
     )
 
-
+# ------------- CONFIG API -------------
 @app.route("/api/config", methods=["GET", "POST"])
 def api_config():
-    global MIN_MM, MAX_MM, DEBOUNCE_MS, IGNORE_ZERO_DISTANCE, MIN_STRENGTH
-    global SCHEDULE_URL, cfg
+    global cfg, SCHEDULE_URL, GITHUB_TOKEN, SCHEDULE_REFRESH_SECONDS
+    global DEBOUNCE_MS, IGNORE_ZERO_DISTANCE, MIN_STRENGTH, test_mode
 
     if request.method == "GET":
-        return jsonify(
-            {
-                "min_mm": MIN_MM,
-                "max_mm": MAX_MM,
-                "debounce_ms": DEBOUNCE_MS,
-                "ignore_zero_distance": IGNORE_ZERO_DISTANCE,
-                "min_strength": MIN_STRENGTH,
-                "schedule_url": SCHEDULE_URL,
-            }
-        )
+        # Return the full config.json contents
+        return jsonify(cfg)
 
     data = request.json or {}
 
-    if "min_mm" in data:
-        MIN_MM = float(data["min_mm"])
-    if "max_mm" in data:
-        MAX_MM = float(data["max_mm"])
-    if "debounce_ms" in data:
-        DEBOUNCE_MS = int(data["debounce_ms"])
-    if "ignore_zero_distance" in data:
-        IGNORE_ZERO_DISTANCE = bool(data["ignore_zero_distance"])
-    if "min_strength" in data:
-        MIN_STRENGTH = int(data["min_strength"])
-    if "schedule_url" in data:
-        SCHEDULE_URL = data["schedule_url"] or ""
+    # Top-level simple keys
+    for k in ["serial_port", "baudrate", "database"]:
+        if k in data:
+            cfg[k] = data[k]
 
-    # persist back to config.json
-    if "detection" not in cfg:
-        cfg["detection"] = {}
-    if "schedule" not in cfg:
-        cfg["schedule"] = {}
+    # MQTT
+    if "mqtt" in data and isinstance(data["mqtt"], dict):
+        if "mqtt" not in cfg or not isinstance(cfg["mqtt"], dict):
+            cfg["mqtt"] = {}
+        cfg["mqtt"].update(data["mqtt"])
 
-    cfg["detection"]["min_mm"] = MIN_MM
-    cfg["detection"]["max_mm"] = MAX_MM
-    cfg["detection"]["debounce_ms"] = DEBOUNCE_MS
-    cfg["detection"]["ignore_zero_distance"] = IGNORE_ZERO_DISTANCE
-    cfg["detection"]["min_strength"] = MIN_STRENGTH
+    # HTTP
+    if "http" in data and isinstance(data["http"], dict):
+        if "http" not in cfg or not isinstance(cfg["http"], dict):
+            cfg["http"] = {}
+        cfg["http"].update(data["http"])
 
-    cfg["schedule"]["url"] = SCHEDULE_URL
-    cfg["schedule"]["github_token"] = GITHUB_TOKEN  # keep as-is
+    # Detection
+    if "detection" in data and isinstance(data["detection"], dict):
+        if "detection" not in cfg or not isinstance(cfg["detection"], dict):
+            cfg["detection"] = {}
+        cfg["detection"].update(data["detection"])
 
+    # Schedule
+    if "schedule" in data and isinstance(data["schedule"], dict):
+        if "schedule" not in cfg or not isinstance(cfg["schedule"], dict):
+            cfg["schedule"] = {}
+        cfg["schedule"].update(data["schedule"])
+
+    # Persist back to file
     with open(CFG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
 
-    return jsonify(
-        {
-            "ok": True,
-            "min_mm": MIN_MM,
-            "max_mm": MAX_MM,
-            "debounce_ms": DEBOUNCE_MS,
-            "ignore_zero_distance": IGNORE_ZERO_DISTANCE,
-            "min_strength": MIN_STRENGTH,
-            "schedule_url": SCHEDULE_URL,
-        }
-    )
+    # Apply selected runtime fields
+    det = cfg.get("detection", {})
+    DEBOUNCE_MS = int(det.get("debounce_ms", DEBOUNCE_MS))
+    IGNORE_ZERO_DISTANCE = bool(det.get("ignore_zero_distance", IGNORE_ZERO_DISTANCE))
+    MIN_STRENGTH = int(det.get("min_strength", MIN_STRENGTH))
+    if "test_mode" in det:
+        with state_lock:
+            test_mode = bool(det["test_mode"])
 
+    sch = cfg.get("schedule", {})
+    SCHEDULE_URL = sch.get("url", SCHEDULE_URL)
+    GITHUB_TOKEN = sch.get("github_token", GITHUB_TOKEN)
+    SCHEDULE_REFRESH_SECONDS = int(sch.get("check_interval_sec", SCHEDULE_REFRESH_SECONDS))
 
+    return jsonify({"ok": True, "config": cfg})
+
+# ------------- MODE API -------------
 @app.route("/api/mode", methods=["GET", "POST"])
 def api_mode():
     global test_mode, test_count_today, manual_override
@@ -606,7 +666,6 @@ def api_mode():
     with state_lock:
         if "test_mode" in data:
             new_tm = bool(data["test_mode"])
-            # when enabling test mode, clear test counter
             if new_tm and not test_mode:
                 test_count_today = 0
             test_mode = new_tm
@@ -616,9 +675,16 @@ def api_mode():
         tm = test_mode
         mo = manual_override
 
+    # Also update cfg.detection.test_mode for persistence
+    if "detection" not in cfg:
+        cfg["detection"] = {}
+    cfg["detection"]["test_mode"] = tm
+    with open(CFG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
     return jsonify({"ok": True, "test_mode": tm, "manual_override": mo})
 
-
+# ------------- SCHEDULE APIs -------------
 @app.route("/api/schedule/refresh", methods=["POST"])
 def api_schedule_refresh():
     ok = refresh_schedule()
@@ -634,6 +700,70 @@ def api_schedule_refresh():
     )
 
 
+@app.route("/api/schedule/local", methods=["GET", "POST"])
+def api_schedule_local():
+    global schedule_data, schedule_last_fetch_utc, schedule_last_status
+
+    if request.method == "GET":
+        # Prefer in-memory schedule if present
+        with state_lock:
+            data = schedule_data
+
+        if data is None:
+            # Try to load from local file
+            if not load_local_schedule():
+                # Return a default blank schedule
+                default = []
+                for _ in range(7):
+                    default.append(
+                        {
+                            "Enable": False,
+                            "StartShow": "16:30",
+                            "ShowStop": "22:00"
+                        }
+                    )
+                return jsonify(default)
+
+            with state_lock:
+                data = schedule_data
+
+        return jsonify(data)
+
+    # POST: Save new schedule locally and apply immediately
+    new_sched = request.json
+    if not isinstance(new_sched, list) or len(new_sched) != 7:
+        return jsonify({"ok": False, "error": "Schedule must be a list of 7 entries"}), 400
+
+    # Basic validation
+    for i, entry in enumerate(new_sched):
+        if not isinstance(entry, dict):
+            return jsonify({"ok": False, "error": f"Entry {i} must be an object"}), 400
+        if "Enable" not in entry or "StartShow" not in entry or "ShowStop" not in entry:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": f"Entry {i} must include Enable, StartShow, ShowStop",
+                }
+            ), 400
+
+    # Save to disk
+    try:
+        with open(SCHED_LOCAL_PATH, "w") as f:
+            json.dump(new_sched, f, indent=2)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    # Update in-memory
+    with state_lock:
+        globals()["schedule_data"] = new_sched
+        globals()["schedule_last_fetch_utc"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+        globals()["schedule_last_status"] = "Updated via local editor"
+
+    return jsonify({"ok": True})
+
+# ------------- STATS APIs -------------
 @app.route("/api/stats", methods=["GET"])
 def api_stats():
     # DB-based stats
@@ -641,19 +771,22 @@ def api_stats():
         cur = db_conn.cursor()
         # today (local time)
         cur.execute(
-            "SELECT COUNT(*) FROM detections WHERE date(ts_utc,'localtime') = date('now','localtime');"
+            "SELECT COUNT(*) FROM detections WHERE "
+            "date(ts_utc,'localtime') = date('now','localtime');"
         )
         today_db = cur.fetchone()[0]
 
         # yesterday
         cur.execute(
-            "SELECT COUNT(*) FROM detections WHERE date(ts_utc,'localtime') = date('now','localtime','-1 day');"
+            "SELECT COUNT(*) FROM detections WHERE "
+            "date(ts_utc,'localtime') = date('now','localtime','-1 day');"
         )
         yesterday = cur.fetchone()[0]
 
         # last 7 days
         cur.execute(
-            "SELECT COUNT(*) FROM detections WHERE ts_utc >= datetime('now','localtime','-7 days');"
+            "SELECT COUNT(*) FROM detections WHERE "
+            "ts_utc >= datetime('now','localtime','-7 days');"
         )
         week = cur.fetchone()[0]
 
@@ -679,11 +812,47 @@ def api_stats():
     )
 
 
+@app.route("/api/stats/hourly", methods=["GET"])
+def api_stats_hourly():
+    """
+    Returns hourly counts for today, filtered to only hours where
+    the schedule is active (Enable + StartShow/ShowStop).
+    """
+    with db_lock:
+        cur = db_conn.cursor()
+        cur.execute(
+            "SELECT strftime('%H', ts_utc,'localtime') AS h, "
+            "COUNT(*) FROM detections "
+            "WHERE date(ts_utc,'localtime') = date('now','localtime') "
+            "GROUP BY h ORDER BY h;"
+        )
+        rows = cur.fetchall()
+
+    now_local = datetime.now()
+    hours = []
+    counts = []
+
+    for h_str, count in rows:
+        try:
+            h_int = int(h_str)
+        except (TypeError, ValueError):
+            continue
+
+        dt_candidate = now_local.replace(hour=h_int, minute=0, second=0, microsecond=0)
+        valid, active, enabled = compute_schedule_flags(dt_candidate)
+        if not (valid and enabled and active):
+            continue
+
+        hours.append(h_str)
+        counts.append(count)
+
+    return jsonify({"hours": hours, "counts": counts})
+
+# ------------- OLD COMPAT / MAINTENANCE -------------
 @app.route("/reset_count", methods=["POST"])
 def reset_count():
     """
-    Kept for backward compatibility; resets today's test count and DB total_count.
-    Not used by the current UI (UI uses /wipe_all).
+    Kept for backward compatibility; resets DB total_count and test counter.
     """
     reset_total_count()
     with state_lock:
@@ -699,7 +868,6 @@ def wipe_all():
     return jsonify({"ok": True})
 
 
-# -------- OPTIONAL: recent/total endpoints kept for completeness --------
 @app.route("/api/total", methods=["GET"])
 def api_total():
     return jsonify({"total_count": get_total_count()})
@@ -711,36 +879,33 @@ def api_recent():
     with db_lock:
         cur = db_conn.cursor()
         cur.execute(
-            "SELECT id, ts_utc, distance_mm FROM detections ORDER BY id DESC LIMIT ?;",
+            "SELECT id, ts_utc, distance_mm "
+            "FROM detections ORDER BY id DESC LIMIT ?;",
             (limit,),
         )
         rows = cur.fetchall()
     out = [{"id": r[0], "ts_utc": r[1], "distance_mm": r[2]} for r in rows]
     return jsonify(out)
 
-# ----------------- SCHEDULE EVAL LOOP -----------------
-def schedule_eval_loop():
-    """Recompute schedule_active & schedule_valid once per minute."""
-    global schedule_valid, schedule_active
-
-    while True:
-        try:
-            now_local = datetime.now()   # Pi is assumed to keep local timezone
-            valid, active, enabled = compute_schedule_flags(now_local)
-
-            with state_lock:
-                schedule_valid = valid
-                # Active only if enabled AND inside window
-                # OR manual override
-                if manual_override:
-                    schedule_active = True
-                else:
-                    schedule_active = valid and enabled and active
-        except Exception as e:
-            print("Schedule eval error:", e)
-
-        time.sleep(60)  # recompute every minute
-
+@app.route("/api/service/restart", methods=["POST"])
+def restart_service():
+    try:
+        subprocess.Popen(
+            [
+                "/usr/bin/sudo",
+                "-n",
+                "/bin/systemctl",
+                "restart",
+                "--no-block",
+                "ShowMonLidarCounter"
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
+    
 # ----------------- MAIN -----------------
 if __name__ == "__main__":
     # sensor thread
@@ -751,7 +916,7 @@ if __name__ == "__main__":
     s = threading.Thread(target=schedule_loop, daemon=True)
     s.start()
 
-    # NEW real-time schedule evaluator (local clock)
+    # real-time schedule evaluator (local clock)
     e = threading.Thread(target=schedule_eval_loop, daemon=True)
     e.start()
 
