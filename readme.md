@@ -11,9 +11,10 @@ Pin 10 - RXD
 
 ## Install
 
-Clone repo and run:
-
-```bash
-git clone https://github.com/krhodus/ShowMonLidarCounter.git
-cd ShowMonLidarCounter
-sudo batch install.sh
+- install Pi Lite OS and enable SSH or use local keyboard
+- Create used named admin with a password of your choice
+- Run `sudo apt update`
+- Run `sudo apt install git`
+- Run `git clone https://github.com/krhodus/ShowMonLidarCounter.git`
+- Run `cd ShowMonLidarCounter`
+- Run `sudo bash install.sh`
