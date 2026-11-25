@@ -24,6 +24,10 @@
     "test_mode": false
   },
 
+  "webhook": {
+    "url": ""
+  },
+
   "schedule": {
     "url": "",
     "check_interval_sec": 1200,

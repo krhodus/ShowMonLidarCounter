@@ -117,6 +117,23 @@ button.gray { background:#555; color:#fff; }
       </div>
 
       <div class="card">
+        <h2>Hourly Webhook</h2>
+        <label>Webhook URL</label>
+        <input type="text" id="webhook_url" style="max-width:100%;">
+        <div class="smallNote">
+          At the top of each hour during scheduled show hours, the hourly
+          attendance table is POSTed here as JSON. Leave blank to disable.
+          Applies immediately, no restart needed.
+        </div>
+        <button class="gray" type="button" onclick="testWebhook()">Send Test Webhook</button>
+        <div class="smallNote">
+          Saves the URL, then sends the current table now (including the
+          current partial hour), regardless of the schedule.
+        </div>
+        <div id="webhook_result" class="smallNote" style="white-space:pre-wrap; word-break:break-all;"></div>
+      </div>
+
+      <div class="card">
         <h2>Schedule (Remote)</h2>
         <label>Schedule URL</label>
         <input type="text" id="sch_url">
@@ -169,6 +186,8 @@ async function loadConfig() {
     document.getElementById("det_min_strength").value = d.min_strength ?? 0;
     document.getElementById("det_test_mode").checked = !!d.test_mode;
 
+    document.getElementById("webhook_url").value = (cfg.webhook || {}).url ?? "";
+
     const s = cfg.schedule || {};
     document.getElementById("sch_url").value = s.url ?? "";
     document.getElementById("sch_interval").value = s.check_interval_sec ?? 1200;
@@ -207,6 +226,10 @@ async function saveConfig(ev) {
       test_mode: document.getElementById("det_test_mode").checked
     },
 
+    webhook: {
+      url: document.getElementById("webhook_url").value.trim()
+    },
+
     schedule: {
       url: document.getElementById("sch_url").value,
       check_interval_sec: parseInt(document.getElementById("sch_interval").value || "1200", 10),
@@ -229,6 +252,24 @@ async function saveConfig(ev) {
   } catch(e) {
     console.log("saveConfig error", e);
     alert("Failed to save config.");
+  }
+}
+
+async function testWebhook() {
+  const out = document.getElementById("webhook_result");
+  out.textContent = "Sending...";
+  try {
+    await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ webhook: { url: document.getElementById("webhook_url").value.trim() } })
+    });
+    const r = await fetch("/api/webhook/test", { method: "POST" });
+    const j = await r.json();
+    out.textContent = (j.ok ? "Success (HTTP " + j.detail + ")" : "Failed: " + (j.detail || j.error))
+      + (j.payload ? "\n" + JSON.stringify(j.payload) : "");
+  } catch (e) {
+    out.textContent = "Request failed: " + e;
   }
 }
 
