@@ -14,6 +14,7 @@ v1.0
 
 """
 
+import copy
 import json
 import os
 import sqlite3
@@ -27,7 +28,7 @@ import paho.mqtt.client as mqtt
 import serial
 from flask import Flask, jsonify, request, render_template
 
-DEBUG_SENSOR = True
+DEBUG_SENSOR = False
 
 # ----------------- PATHS & CONFIG -----------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -66,6 +67,21 @@ SCHEDULE_CFG = cfg.get("schedule", {})
 SCHEDULE_URL = SCHEDULE_CFG.get("url", "")
 GITHUB_TOKEN = SCHEDULE_CFG.get("github_token", "")
 SCHEDULE_REFRESH_SECONDS = int(SCHEDULE_CFG.get("check_interval_sec", 1200))
+
+# Webhook URL is read from cfg at post time so changes apply without a restart
+
+cfg_lock = threading.RLock()
+
+
+def write_json_atomic(path, data):
+    """Write JSON via temp file + rename so a power cut can't leave a half-written file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
 
 # ----------------- DB -----------------
 def init_db():
@@ -140,11 +156,16 @@ def wipe_database():
 mqtt_client = mqtt.Client()
 if MQTT_USER:
     mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
-try:
-    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-    mqtt_client.loop_start()
-except Exception as e:
-    print("Warning: could not connect to MQTT broker:", e)
+mqtt_client.max_queued_messages_set(200)  # don't grow without bound while broker is down
+if MQTT_BROKER:
+    try:
+        # connect_async + loop_start keeps retrying if the broker is down at boot
+        mqtt_client.connect_async(MQTT_BROKER, MQTT_PORT, keepalive=60)
+        mqtt_client.loop_start()
+    except Exception as e:
+        print("Warning: could not start MQTT client:", e)
+else:
+    print("MQTT broker not configured; MQTT publishing disabled")
 
 
 def publish_detection(distance_mm: int):
@@ -162,7 +183,7 @@ def publish_detection(distance_mm: int):
         # Last 7 days
         cur.execute(
             "SELECT COUNT(*) FROM detections "
-            "WHERE ts_utc >= datetime('now','localtime','-7 days');"
+            "WHERE datetime(ts_utc) >= datetime('now','-7 days');"
         )
         count_week = cur.fetchone()[0]
 
@@ -179,6 +200,8 @@ def publish_detection(distance_mm: int):
         "last_distance_mm": int(distance_mm),
     }
 
+    if not MQTT_BROKER:
+        return
     try:
         mqtt_client.publish(MQTT_TOPIC, json.dumps(payload), qos=1)
     except Exception as e:
@@ -315,8 +338,7 @@ def refresh_schedule():
 
         # Write local copy
         try:
-            with open(SCHED_LOCAL_PATH, "w") as f:
-                json.dump(data, f, indent=2)
+            write_json_atomic(SCHED_LOCAL_PATH, data)
         except Exception as e:
             print("Warning: could not write local schedule.json:", e)
             
@@ -376,7 +398,7 @@ def schedule_loop():
     # initial fetch
     refresh_schedule()
     while True:
-        time.sleep(SCHEDULE_REFRESH_SECONDS)
+        time.sleep(max(30, SCHEDULE_REFRESH_SECONDS))
         refresh_schedule()
 
 # ----------------- Sensor loop -----------------
@@ -388,12 +410,18 @@ def dlog(msg):
 def sensor_loop():
     global IGNORE_ZERO_DISTANCE, MIN_STRENGTH, DEBOUNCE_MS, DEBUG_SENSOR
 
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUD, timeout=1)
-        dlog(f"Opened serial port {SERIAL_PORT} @ {BAUD}")
-    except Exception as e:
-        print("Could not open serial port:", e)
-        return
+    def open_serial():
+        """Block until the serial port opens, retrying every 5 seconds."""
+        while True:
+            try:
+                port = serial.Serial(SERIAL_PORT, BAUD, timeout=1)
+                print(f"Opened serial port {SERIAL_PORT} @ {BAUD}")
+                return port
+            except Exception as e:
+                print("Could not open serial port (retrying in 5s):", e)
+                time.sleep(5)
+
+    ser = open_serial()
 
     read_buf = bytearray()
 
@@ -498,6 +526,19 @@ def sensor_loop():
         except Exception as e:
             print("Serial read error:", e)
             time.sleep(0.5)
+            if isinstance(e, (serial.SerialException, OSError)):
+                # Port went away (unplugged / glitch): close and reopen
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = open_serial()
+                read_buf = bytearray()
+                car_active = False
+                last_state_is_car = False
+                car_since_ms = None
+                with state_lock:
+                    state["car_present"] = False
 
 
 def handle_detection(distance_mm: int, log_to_db: bool):
@@ -522,9 +563,135 @@ def handle_detection(distance_mm: int, log_to_db: bool):
     except Exception as e:
         print("MQTT publish error:", e)
 
+# ----------------- HOURLY WEBHOOK -----------------
+DEFAULT_WEBHOOK_START_HOUR = 16   # used when no usable schedule entry exists
+WEBHOOK_TICK_SECONDS = 30
+WEBHOOK_ATTEMPTS = 3
+WEBHOOK_RETRY_DELAY = 5
+
+
+def build_hourly_payload(now_local: datetime, include_current: bool = False) -> dict:
+    """
+    Build the hourly attendance table.
+    Keys run from today's StartShow hour through 23. Hours that have completed
+    carry their real count; the current hour (unless include_current) and
+    later hours are 0.
+    """
+    with db_lock:
+        cur = db_conn.cursor()
+        cur.execute(
+            "SELECT CAST(strftime('%H', ts_utc,'localtime') AS INTEGER) AS h, COUNT(*) "
+            "FROM detections "
+            "WHERE date(ts_utc,'localtime') = date('now','localtime') "
+            "GROUP BY h;"
+        )
+        per_hour = {int(h): int(c) for h, c in cur.fetchall()}
+
+        cur.execute("SELECT value FROM metadata WHERE key='total_count';")
+        row = cur.fetchone()
+        overall = int(row[0]) if row else 0
+
+    with state_lock:
+        tm = test_mode
+        today_test = test_count_today
+        data = schedule_data
+
+    current = today_test if tm else sum(per_hour.values())
+
+    try:
+        entry = data[(now_local.weekday() + 1) % 7]
+        start_hour = int(str(entry.get("StartShow", "")).split(":")[0])
+    except Exception:
+        start_hour = DEFAULT_WEBHOOK_START_HOUR
+
+    threshold = now_local.hour + (1 if include_current else 0)
+
+    payload = {}
+    for h in range(start_hour, 24):
+        payload[str(h)] = per_hour.get(h, 0) if h < threshold else 0
+
+    payload["OverallAttendance"] = overall
+    payload["CurrentAttendance"] = current
+    payload["Message"] = ""
+    return payload
+
+
+def get_webhook_url() -> str:
+    with cfg_lock:
+        return str((cfg.get("webhook") or {}).get("url", "") or "").strip()
+
+
+def send_webhook(payload: dict, url: str, attempts: int = WEBHOOK_ATTEMPTS):
+    """POST payload as JSON. Returns (ok, detail)."""
+    detail = "no attempt made"
+    for n in range(1, attempts + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.ok:
+                dlog(f"Webhook POST ok ({resp.status_code})")
+                return True, resp.status_code
+            detail = f"HTTP {resp.status_code}"
+        except Exception as e:
+            detail = str(e)
+        print(f"Webhook attempt {n}/{attempts} failed: {detail}")
+        if n < attempts:
+            time.sleep(WEBHOOK_RETRY_DELAY)
+    return False, detail
+
+
+def webhook_schedule_ok(at: datetime) -> bool:
+    valid, active, enabled = compute_schedule_flags(at)
+    with state_lock:
+        mo = manual_override
+    return bool(mo or (valid and enabled and active))
+
+
+def post_hourly_webhook(now_local: datetime, include_current: bool = False):
+    url = get_webhook_url()
+    if not url:
+        return
+    send_webhook(build_hourly_payload(now_local, include_current), url)
+
+
+def webhook_loop():
+    """
+    Poll the clock every few seconds (robust to NTP clock jumps on a Pi
+    without an RTC) and:
+      - post when the hour rolls over, if the schedule was active at the
+        top of that hour (completed hours only);
+      - post a final table (including the current partial hour) when the
+        show ends part-way through an hour.
+    """
+    now = datetime.now()
+    last_key = (now.date(), now.hour)
+    was_active = webhook_schedule_ok(now)
+
+    while True:
+        time.sleep(WEBHOOK_TICK_SECONDS)
+        try:
+            now = datetime.now()
+            key = (now.date(), now.hour)
+            active = webhook_schedule_ok(now)
+
+            if key != last_key:
+                moved_forward = key > last_key
+                last_key = key
+                boundary = now.replace(minute=0, second=0, microsecond=0)
+                # Judge the schedule at the top of the hour, not a few seconds after
+                if moved_forward and webhook_schedule_ok(boundary):
+                    post_hourly_webhook(now)
+            elif was_active and not active and now.minute != 0:
+                # Show ended mid-hour: send a final table with the partial hour
+                post_hourly_webhook(now, include_current=True)
+
+            was_active = active
+        except Exception as e:
+            print("Webhook loop error:", e)
+
+
 # ----------------- SCHEDULE EVAL LOOP -----------------
 def schedule_eval_loop():
-    """Recompute schedule_active & schedule_valid once per minute."""
+    """Recompute schedule_active & schedule_valid every few seconds."""
     global schedule_valid, schedule_active
 
     while True:
@@ -541,7 +708,7 @@ def schedule_eval_loop():
         except Exception as e:
             print("Schedule eval error:", e)
 
-        time.sleep(60)  # recompute every minute
+        time.sleep(5)  # recompute every few seconds so show start/stop is prompt
 
 # ----------------- Flask app -----------------
 app = Flask(__name__, template_folder="templates")
@@ -591,65 +758,98 @@ def api_status():
     )
 
 # ------------- CONFIG API -------------
+SECRET_MASK = "********"
+SECRET_FIELDS = {"mqtt": ("password",), "schedule": ("github_token",)}
+
+
+def _public_cfg():
+    """Config copy with secrets masked (the config page never needs the real values)."""
+    out = copy.deepcopy(cfg)
+    for section, fields in SECRET_FIELDS.items():
+        sec = out.get(section)
+        if isinstance(sec, dict):
+            for f in fields:
+                if sec.get(f):
+                    sec[f] = SECRET_MASK
+    return out
+
+
 @app.route("/api/config", methods=["GET", "POST"])
 def api_config():
     global cfg, SCHEDULE_URL, GITHUB_TOKEN, SCHEDULE_REFRESH_SECONDS
     global DEBOUNCE_MS, IGNORE_ZERO_DISTANCE, MIN_STRENGTH, test_mode
 
     if request.method == "GET":
-        # Return the full config.json contents
-        return jsonify(cfg)
+        with cfg_lock:
+            return jsonify(_public_cfg())
 
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
 
-    # Top-level simple keys
-    for k in ["serial_port", "baudrate", "database"]:
-        if k in data:
-            cfg[k] = data[k]
+    with cfg_lock:
+        new_cfg = copy.deepcopy(cfg)
 
-    # MQTT
-    if "mqtt" in data and isinstance(data["mqtt"], dict):
-        if "mqtt" not in cfg or not isinstance(cfg["mqtt"], dict):
-            cfg["mqtt"] = {}
-        cfg["mqtt"].update(data["mqtt"])
+        for k in ["serial_port", "baudrate", "database"]:
+            if k in data:
+                new_cfg[k] = data[k]
 
-    # HTTP
-    if "http" in data and isinstance(data["http"], dict):
-        if "http" not in cfg or not isinstance(cfg["http"], dict):
-            cfg["http"] = {}
-        cfg["http"].update(data["http"])
+        for section in ("mqtt", "http", "detection", "webhook", "schedule"):
+            incoming = data.get(section)
+            if not isinstance(incoming, dict):
+                continue
+            incoming = dict(incoming)
+            # A masked secret means "unchanged"
+            for f in SECRET_FIELDS.get(section, ()):
+                if incoming.get(f) == SECRET_MASK:
+                    incoming.pop(f)
+            if not isinstance(new_cfg.get(section), dict):
+                new_cfg[section] = {}
+            new_cfg[section].update(incoming)
 
-    # Detection
-    if "detection" in data and isinstance(data["detection"], dict):
-        if "detection" not in cfg or not isinstance(cfg["detection"], dict):
-            cfg["detection"] = {}
-        cfg["detection"].update(data["detection"])
+        # Validate everything BEFORE touching the file or runtime state
+        try:
+            det = new_cfg.get("detection", {})
+            new_debounce = int(det.get("debounce_ms", DEBOUNCE_MS))
+            new_ignore = bool(det.get("ignore_zero_distance", IGNORE_ZERO_DISTANCE))
+            new_min_strength = int(det.get("min_strength", MIN_STRENGTH))
+            sch = new_cfg.get("schedule", {})
+            new_interval = int(sch.get("check_interval_sec", SCHEDULE_REFRESH_SECONDS))
+            int(new_cfg.get("baudrate", BAUD))
+            int(new_cfg.get("http", {}).get("port", HTTP_PORT))
+            int(new_cfg.get("mqtt", {}).get("port", MQTT_PORT))
+        except (TypeError, ValueError) as e:
+            return jsonify({"ok": False, "error": f"Invalid value: {e}"}), 400
 
-    # Schedule
-    if "schedule" in data and isinstance(data["schedule"], dict):
-        if "schedule" not in cfg or not isinstance(cfg["schedule"], dict):
-            cfg["schedule"] = {}
-        cfg["schedule"].update(data["schedule"])
+        try:
+            write_json_atomic(CFG_PATH, new_cfg)
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"Could not save: {e}"}), 500
 
-    # Persist back to file
-    with open(CFG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
+        cfg = new_cfg
 
-    # Apply selected runtime fields
-    det = cfg.get("detection", {})
-    DEBOUNCE_MS = int(det.get("debounce_ms", DEBOUNCE_MS))
-    IGNORE_ZERO_DISTANCE = bool(det.get("ignore_zero_distance", IGNORE_ZERO_DISTANCE))
-    MIN_STRENGTH = int(det.get("min_strength", MIN_STRENGTH))
-    if "test_mode" in det:
-        with state_lock:
-            test_mode = bool(det["test_mode"])
+        # Apply selected runtime fields
+        DEBOUNCE_MS = new_debounce
+        IGNORE_ZERO_DISTANCE = new_ignore
+        MIN_STRENGTH = new_min_strength
+        if "test_mode" in det:
+            with state_lock:
+                test_mode = bool(det["test_mode"])
 
-    sch = cfg.get("schedule", {})
-    SCHEDULE_URL = sch.get("url", SCHEDULE_URL)
-    GITHUB_TOKEN = sch.get("github_token", GITHUB_TOKEN)
-    SCHEDULE_REFRESH_SECONDS = int(sch.get("check_interval_sec", SCHEDULE_REFRESH_SECONDS))
+        SCHEDULE_URL = sch.get("url", SCHEDULE_URL)
+        GITHUB_TOKEN = sch.get("github_token", GITHUB_TOKEN)
+        SCHEDULE_REFRESH_SECONDS = new_interval
 
-    return jsonify({"ok": True, "config": cfg})
+        return jsonify({"ok": True, "config": _public_cfg()})
+
+
+@app.route("/api/webhook/test", methods=["POST"])
+def api_webhook_test():
+    """Send the hourly table to the saved webhook URL right now (ignores the schedule)."""
+    url = get_webhook_url()
+    if not url:
+        return jsonify({"ok": False, "detail": "No webhook URL configured"}), 400
+    payload = build_hourly_payload(datetime.now(), include_current=True)
+    ok, detail = send_webhook(payload, url, attempts=1)
+    return jsonify({"ok": ok, "detail": detail, "payload": payload}), (200 if ok else 502)
 
 # ------------- MODE API -------------
 @app.route("/api/mode", methods=["GET", "POST"])
@@ -676,11 +876,14 @@ def api_mode():
         mo = manual_override
 
     # Also update cfg.detection.test_mode for persistence
-    if "detection" not in cfg:
-        cfg["detection"] = {}
-    cfg["detection"]["test_mode"] = tm
-    with open(CFG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
+    with cfg_lock:
+        if not isinstance(cfg.get("detection"), dict):
+            cfg["detection"] = {}
+        cfg["detection"]["test_mode"] = tm
+        try:
+            write_json_atomic(CFG_PATH, cfg)
+        except Exception as e:
+            print("Could not persist test_mode:", e)
 
     return jsonify({"ok": True, "test_mode": tm, "manual_override": mo})
 
@@ -748,8 +951,7 @@ def api_schedule_local():
 
     # Save to disk
     try:
-        with open(SCHED_LOCAL_PATH, "w") as f:
-            json.dump(new_sched, f, indent=2)
+        write_json_atomic(SCHED_LOCAL_PATH, new_sched)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -786,7 +988,7 @@ def api_stats():
         # last 7 days
         cur.execute(
             "SELECT COUNT(*) FROM detections WHERE "
-            "ts_utc >= datetime('now','localtime','-7 days');"
+            "datetime(ts_utc) >= datetime('now','-7 days');"
         )
         week = cur.fetchone()[0]
 
@@ -908,6 +1110,10 @@ def restart_service():
     
 # ----------------- MAIN -----------------
 if __name__ == "__main__":
+    # Load the last-known local schedule first so counting works even if
+    # the remote schedule is unreachable at boot.
+    load_local_schedule()
+
     # sensor thread
     t = threading.Thread(target=sensor_loop, daemon=True)
     t.start()
@@ -919,5 +1125,9 @@ if __name__ == "__main__":
     # real-time schedule evaluator (local clock)
     e = threading.Thread(target=schedule_eval_loop, daemon=True)
     e.start()
+
+    # hourly webhook poster
+    w = threading.Thread(target=webhook_loop, daemon=True)
+    w.start()
 
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True)
